@@ -1,96 +1,134 @@
-# SecondBrain MCP v0.2
+# SecondBrain MCP
 
-Read-only semantic layer поверх Obsidian vault.
+Read-only MCP server for Obsidian vaults. Gives AI assistants (Claude, ChatGPT, etc.) semantic access to your notes, projects, decisions, and tasks.
 
-Отвечает не на «какие файлы есть?», а на:
-- какие активные проекты?
-- какой контекст у проекта?
-- какие решения уже были?
-- какие задачи открыты?
-- какие заметки связаны?
-- что известно по теме?
+## What it does
 
-## Tools
+Instead of raw file access, it provides structured tools:
 
-| Tool | Описание |
-|------|----------|
-| `healthcheck` | Статус vault + статистика по типам/статусам |
-| `search_knowledge` | Семантический поиск: имя, алиасы, теги, контент + фильтры |
-| `get_note` | Чтение заметки по пути или имени (frontmatter + body) |
-| `list_projects` | Список проектов с фильтром по статусу |
-| `get_project_context` | Полный контекст проекта: README + связи + задачи + решения |
-| `find_related` | Связанные заметки через wikilinks, backlinks, shared tags |
-| `extract_tasks` | Открытые задачи (чекбоксы) из vault или папки |
-| `extract_decisions` | Decision log из `02_Areas/*/Decisions/` |
+| Tool | Description |
+|------|-------------|
+| `healthcheck` | Vault status and statistics |
+| `search_knowledge` | Full-text + frontmatter search with filters |
+| `get_note` | Read a note by path or name |
+| `list_projects` | List projects, filter by status |
+| `get_project_context` | Full project context: content + related notes + tasks + decisions |
+| `find_related` | Find connected notes via wikilinks, backlinks, shared tags |
+| `extract_tasks` | Open/completed tasks from vault or folder |
+| `extract_decisions` | Decision log entries |
 
-## Data Contract
-
-- **Excluded folders:** `.git`, `.obsidian`, `node_modules`, `99_Private`, `_attachments`, `mcp`
-- **Note types:** `project`, `area`, `resource`, `person`, `daily`, `moc`, `decision`, `inbox`, `about`
-- **Statuses:** `active`, `paused`, `done`, `someday`
-- **Frontmatter:** YAML с полями `type`, `status`, `created`, `updated`, `tags`, `aliases`, `related`
-- **Связи:** `[[wikilinks]]` + `related:` в frontmatter + backlinks + shared tags
-
-## Setup
+## Install
 
 ```bash
-cd mcp
+git clone <repo-url> && cd sb-mcp
 npm install
 npm run build
 ```
 
-## Конфиги клиентов
+## Usage
 
-### Claude Code (`.claude/settings.json` или `.mcp.json`)
+### Stdio (local, single client)
 
+```bash
+OBSIDIAN_VAULT_PATH=/path/to/vault node dist/index.js
+```
+
+### HTTP (remote, multi-client)
+
+```bash
+OBSIDIAN_VAULT_PATH=/path/to/vault \
+MCP_AUTH_TOKEN=your-secret-token \
+MCP_PORT=3100 \
+node dist/index.js --http
+```
+
+## Authentication
+
+In HTTP mode, set `MCP_AUTH_TOKEN` to require Bearer token auth on every request.
+
+Clients must send the header:
+```
+Authorization: Bearer your-secret-token
+```
+
+If `MCP_AUTH_TOKEN` is not set, the server runs without auth (not recommended for public networks).
+
+Generate a token:
+```bash
+openssl rand -hex 32
+```
+
+## Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OBSIDIAN_VAULT_PATH` | current directory | Path to Obsidian vault |
+| `MCP_TRANSPORT` | `stdio` | Transport mode: `stdio` or `http` |
+| `MCP_PORT` | `3100` | HTTP server port |
+| `MCP_AUTH_TOKEN` | — | Bearer token for HTTP auth (recommended) |
+
+## Client configuration
+
+### Claude Code (`.mcp.json`)
+
+**Stdio (local):**
 ```json
 {
   "mcpServers": {
     "secondbrain": {
       "command": "node",
-      "args": ["/path/to/second-brain/mcp/dist/index.js"],
+      "args": ["/path/to/sb-mcp/dist/index.js"],
       "env": {
-        "OBSIDIAN_VAULT_PATH": "/path/to/second-brain"
+        "OBSIDIAN_VAULT_PATH": "/path/to/vault"
       }
     }
   }
 }
 ```
 
-### Hermes / Codex / Custom agents
-
+**HTTP (remote):**
 ```json
 {
   "mcpServers": {
     "secondbrain": {
-      "command": "node",
-      "args": ["/root/vaults/second-brain/mcp/dist/index.js"],
-      "env": {
-        "OBSIDIAN_VAULT_PATH": "/root/vaults/second-brain"
+      "type": "url",
+      "url": "http://your-server:3100/mcp",
+      "headers": {
+        "Authorization": "Bearer your-secret-token"
       }
     }
   }
 }
 ```
 
-### Server (systemd)
+### ChatGPT / other clients
+
+Use the HTTP endpoint `http://your-server:3100/mcp` with the `Authorization: Bearer <token>` header.
+
+### systemd (server deployment)
 
 ```ini
 # /etc/systemd/system/secondbrain-mcp.service
 [Unit]
 Description=SecondBrain MCP Server
-After=obsidian-sync.service
+After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/node /root/vaults/second-brain/mcp/dist/index.js
-Environment=OBSIDIAN_VAULT_PATH=/root/vaults/second-brain
+ExecStart=/usr/bin/node /path/to/sb-mcp/dist/index.js --http
+Environment=OBSIDIAN_VAULT_PATH=/path/to/vault
+Environment=MCP_AUTH_TOKEN=your-secret-token
+Environment=MCP_PORT=3100
 Restart=on-failure
-User=root
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-> **Note:** MCP stdio transport — каждый клиент запускает свой процесс.
-> Для HTTP transport (multi-client) нужна v0.3.
+## Data contract
+
+- **Excluded folders:** `.git`, `.obsidian`, `node_modules`, `99_Private`, `_attachments`, `mcp`
+- **Note types:** `project`, `area`, `resource`, `person`, `daily`, `moc`, `decision`, `inbox`, `about`
+- **Statuses:** `active`, `paused`, `done`, `someday`
+- **Frontmatter:** YAML with `type`, `status`, `created`, `updated`, `tags`, `aliases`, `related`
+- **Relations:** `[[wikilinks]]` + `related:` in frontmatter + backlinks + shared tags

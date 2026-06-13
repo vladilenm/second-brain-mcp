@@ -27,6 +27,7 @@ const PORT = parseInt(process.env.MCP_PORT ?? '3100', 10);
 const USE_HTTP =
   process.argv.includes('--http') ||
   process.env.MCP_TRANSPORT === 'http';
+const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 
 const vault = new Vault(VAULT_PATH);
 
@@ -302,13 +303,22 @@ async function main() {
     const httpServer = createServer(async (req, res) => {
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, mcp-session-id');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, mcp-session-id, Authorization');
       res.setHeader('Access-Control-Expose-Headers', 'mcp-session-id');
 
       if (req.method === 'OPTIONS') {
         res.writeHead(204);
         res.end();
         return;
+      }
+
+      if (AUTH_TOKEN) {
+        const auth = req.headers['authorization'];
+        if (!auth || auth !== `Bearer ${AUTH_TOKEN}`) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Unauthorized' }));
+          return;
+        }
       }
 
       await transport.handleRequest(req, res);
@@ -318,6 +328,11 @@ async function main() {
       console.error(`SecondBrain MCP (HTTP) listening on port ${PORT}`);
       console.error(`Vault: ${VAULT_PATH}`);
       console.error(`Endpoint: http://0.0.0.0:${PORT}/mcp`);
+      if (AUTH_TOKEN) {
+        console.error('Auth: Bearer token enabled');
+      } else {
+        console.error('⚠ Auth: DISABLED — set MCP_AUTH_TOKEN to protect access');
+      }
     });
   } else {
     const transport = new StdioServerTransport();

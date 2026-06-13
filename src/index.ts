@@ -313,8 +313,10 @@ async function main() {
       }
 
       if (AUTH_TOKEN) {
-        const auth = req.headers['authorization'];
-        if (!auth || auth !== `Bearer ${AUTH_TOKEN}`) {
+        const url = new URL(req.url ?? '/', `http://${req.headers.host}`);
+        const tokenFromQuery = url.searchParams.get('token');
+        const tokenFromHeader = req.headers['authorization']?.replace('Bearer ', '');
+        if (tokenFromQuery !== AUTH_TOKEN && tokenFromHeader !== AUTH_TOKEN) {
           res.writeHead(401, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Unauthorized' }));
           return;

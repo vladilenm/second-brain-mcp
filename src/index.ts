@@ -296,6 +296,9 @@ server.tool(
 
 async function main() {
   if (USE_HTTP) {
+    const transport = new NodeStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+    await server.connect(transport);
+
     const httpServer = createServer(async (req, res) => {
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
@@ -308,8 +311,6 @@ async function main() {
         return;
       }
 
-      const transport = new NodeStreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-      await server.connect(transport);
       await transport.handleRequest(req, res);
     });
 

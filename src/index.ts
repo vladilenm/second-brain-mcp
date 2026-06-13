@@ -15,12 +15,18 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/node';
+import { createServer } from 'node:http';
 import { z } from 'zod';
 import { Vault } from './vault.js';
 
 // ── Config ──────────────────────────────────────────────────
 
 const VAULT_PATH = process.env.OBSIDIAN_VAULT_PATH ?? process.cwd();
+const PORT = parseInt(process.env.MCP_PORT ?? '3100', 10);
+const USE_HTTP =
+  process.argv.includes('--http') ||
+  process.env.MCP_TRANSPORT === 'http';
 
 const vault = new Vault(VAULT_PATH);
 
@@ -289,8 +295,33 @@ server.tool(
 // ── Start ───────────────────────────────────────────────────
 
 async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  if (USE_HTTP) {
+    const httpServer = createServer(async (req, res) => {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, mcp-session-id');
+      res.setHeader('Access-Control-Expose-Headers', 'mcp-session-id');
+
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+
+      const transport = new NodeStreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+      await server.connect(transport);
+      await transport.handleRequest(req, res);
+    });
+
+    httpServer.listen(PORT, () => {
+      console.error(`SecondBrain MCP (HTTP) listening on port ${PORT}`);
+      console.error(`Vault: ${VAULT_PATH}`);
+      console.error(`Endpoint: http://0.0.0.0:${PORT}/mcp`);
+    });
+  } else {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+  }
 }
 
 main().catch((err) => {

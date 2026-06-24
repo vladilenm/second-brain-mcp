@@ -1,7 +1,7 @@
 {
   "name": "secondbrain-mcp",
-  "version": "0.2.0",
-  "description": "Read-only semantic layer over Obsidian vault (SecondBrain MCP)",
+  "version": "0.3.0",
+  "description": "Safe semantic layer over Obsidian vault (SecondBrain MCP)",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -10,7 +10,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "test": "npm run build && node --test dist/**/*.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/node": "^2.0.0-alpha.2",

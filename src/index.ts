@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
 /**
- * SecondBrain MCP v0.2
+ * SecondBrain MCP v0.3
  *
- * Read-only semantic layer over Obsidian vault.
+ * Safe semantic layer over Obsidian vault.
  * Отвечает не на «какие файлы есть?», а на:
  *   - какие активные проекты?
  *   - какой контекст у проекта?
@@ -33,8 +33,50 @@ const vault = new Vault(VAULT_PATH);
 
 const server = new McpServer({
   name: 'secondbrain-mcp',
-  version: '0.2.0',
+  version: '0.3.0',
 });
+
+const noteTypeSchema = z.enum([
+  'project',
+  'area',
+  'resource',
+  'person',
+  'daily',
+  'moc',
+  'decision',
+  'inbox',
+  'about',
+]);
+const noteStatusSchema = z.enum(['active', 'paused', 'done', 'someday']);
+const memoryFileSchema = z.enum(['role', 'rules', 'style', 'projects', 'mistakes', 'examples']);
+const memoryTypeSchema = z.enum(['role', 'rule', 'style', 'project', 'mistake', 'example']);
+
+function jsonText(value: unknown): string {
+  return JSON.stringify(value, null, 2);
+}
+
+function jsonResponse(value: unknown) {
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: jsonText(value),
+      },
+    ],
+  };
+}
+
+function errorResponse(err: unknown) {
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify({ error: err instanceof Error ? err.message : String(err) }),
+      },
+    ],
+    isError: true,
+  };
+}
 
 // ── Tool: healthcheck ───────────────────────────────────────
 
@@ -79,7 +121,7 @@ server.tool(
 
 server.tool(
   'search_knowledge',
-  'Semantic search across vault: full-text + frontmatter matching. Filter by type, status, tags. Returns ranked results with snippets.',
+  'Ranked lexical search across vault: title/name/aliases/tags/related/content matching. Filter by type, status, tags. Returns score, matches, and snippets.',
   {
     query: z.string().describe('Search query — matches name, aliases, tags, and content'),
     type: z
@@ -139,6 +181,259 @@ server.tool(
         },
       ],
     };
+  },
+);
+
+// ── Tool: list_notes ────────────────────────────────────────
+
+server.tool(
+  'list_notes',
+  'List notes with metadata for browsing UI: path, title, frontmatter, mtime, size, hash. Supports folder/type/status/tag filters and pagination.',
+  {
+    folder: z.string().optional().describe('Folder scope, e.g. "01_Projects"'),
+    type: noteTypeSchema.optional().describe('Filter by note type'),
+    status: noteStatusSchema.optional().describe('Filter by note status'),
+    tags: z.array(z.string()).optional().describe('Filter by tags (OR logic)'),
+    limit: z.number().int().min(1).max(200).optional().describe('Max results (default 50)'),
+    offset: z.number().int().min(0).optional().describe('Pagination offset (default 0)'),
+    sort_by: z.enum(['path', 'name', 'created', 'updated', 'mtime']).optional().describe('Sort field'),
+    include_archived: z.boolean().optional().describe('Include 04_Archives notes (default true)'),
+  },
+  async ({ folder, type, status, tags, limit, offset, sort_by, include_archived }) => {
+    try {
+      return jsonResponse(
+        vault.listNotes({
+          folder,
+          type,
+          status,
+          tags,
+          limit,
+          offset,
+          sortBy: sort_by,
+          includeArchived: include_archived,
+        }),
+      );
+    } catch (err) {
+      return errorResponse(err);
+    }
+  },
+);
+
+// ── Tool: read_notes_batch ──────────────────────────────────
+
+server.tool(
+  'read_notes_batch',
+  'Read multiple notes in one call for context building. Returns missing paths separately.',
+  {
+    paths: z.array(z.string()).min(1).max(50).describe('Note paths, names, or aliases'),
+    include_frontmatter: z.boolean().optional().describe('Include parsed frontmatter (default true)'),
+    include_content: z.boolean().optional().describe('Include markdown body (default true)'),
+    max_chars_per_note: z.number().int().min(1).max(50000).optional().describe('Optional content truncation per note'),
+  },
+  async ({ paths, include_frontmatter, include_content, max_chars_per_note }) => {
+    try {
+      return jsonResponse(
+        vault.readNotesBatch({
+          paths,
+          includeFrontmatter: include_frontmatter,
+          includeContent: include_content,
+          maxCharsPerNote: max_chars_per_note,
+        }),
+      );
+    } catch (err) {
+      return errorResponse(err);
+    }
+  },
+);
+
+// ── Tool: get_note_metadata ─────────────────────────────────
+
+server.tool(
+  'get_note_metadata',
+  'Get one note metadata: frontmatter, tags, mtime, hash, wikilinks, backlinks, line count.',
+  {
+    identifier: z.string().describe('Note path, name, or alias'),
+  },
+  async ({ identifier }) => {
+    try {
+      const metadata = vault.getNoteMetadata(identifier);
+      if (!metadata) return errorResponse(`Note not found: ${identifier}`);
+      return jsonResponse(metadata);
+    } catch (err) {
+      return errorResponse(err);
+    }
+  },
+);
+
+// ── Tool: validate_vault_path ───────────────────────────────
+
+server.tool(
+  'validate_vault_path',
+  'Validate whether a relative vault path is safe for read or write. Rejects traversal and excluded folders such as 99_Private.',
+  {
+    path: z.string().describe('Relative path inside the Obsidian vault'),
+    operation: z.enum(['read', 'write']).describe('Operation to validate'),
+  },
+  async ({ path: notePath, operation }) => {
+    return jsonResponse(vault.validateVaultPath(notePath, operation));
+  },
+);
+
+// ── Tool: create_note ───────────────────────────────────────
+
+server.tool(
+  'create_note',
+  'Create a new markdown note safely. Requires frontmatter with type/status/related and refuses to modify existing files.',
+  {
+    path: z.string().describe('Relative .md path inside the vault'),
+    frontmatter: z.record(z.unknown()).describe('YAML frontmatter object'),
+    content: z.string().describe('Markdown body without YAML frontmatter'),
+    if_exists: z.enum(['error']).optional().describe('Existing-file behavior; create_note refuses existing files'),
+    dry_run: z.boolean().optional().describe('Return serialized hash without writing'),
+  },
+  async ({ path: notePath, frontmatter, content, if_exists, dry_run }) => {
+    try {
+      return jsonResponse(
+        vault.createNote({
+          path: notePath,
+          frontmatter,
+          content,
+          ifExists: if_exists,
+          dryRun: dry_run,
+        }),
+      );
+    } catch (err) {
+      return errorResponse(err);
+    }
+  },
+);
+
+// ── Tool: propose_note_update ───────────────────────────────
+
+server.tool(
+  'propose_note_update',
+  'Prepare a note update without writing. Returns old/new hashes and a line diff for user confirmation.',
+  {
+    path: z.string().describe('Relative .md path inside the vault'),
+    expected_hash: z.string().optional().describe('Optional optimistic-lock hash from get_note_metadata/list_notes'),
+    new_content: z.string().describe('New markdown body without YAML frontmatter'),
+    update_reason: z.string().optional().describe('Why this update is proposed'),
+  },
+  async ({ path: notePath, expected_hash, new_content, update_reason }) => {
+    try {
+      return jsonResponse(
+        vault.proposeNoteUpdate({
+          path: notePath,
+          expectedHash: expected_hash,
+          newContent: new_content,
+          updateReason: update_reason,
+        }),
+      );
+    } catch (err) {
+      return errorResponse(err);
+    }
+  },
+);
+
+// ── Tool: apply_note_update ─────────────────────────────────
+
+server.tool(
+  'apply_note_update',
+  'Apply a confirmed note update. Requires confirmed=true and expected_hash to prevent accidental overwrites.',
+  {
+    path: z.string().describe('Relative .md path inside the vault'),
+    expected_hash: z.string().describe('Hash of the version the user reviewed'),
+    new_content: z.string().describe('New markdown body without YAML frontmatter'),
+    confirmed: z.boolean().describe('Must be true after user confirmation'),
+    backup: z.boolean().optional().describe('Create a backup under 00_Meta/AI-System/backups (default true)'),
+  },
+  async ({ path: notePath, expected_hash, new_content, confirmed, backup }) => {
+    try {
+      return jsonResponse(
+        vault.applyNoteUpdate({
+          path: notePath,
+          expectedHash: expected_hash,
+          newContent: new_content,
+          confirmed,
+          backup,
+        }),
+      );
+    } catch (err) {
+      return errorResponse(err);
+    }
+  },
+);
+
+// ── Tool: append_to_note ────────────────────────────────────
+
+server.tool(
+  'append_to_note',
+  'Append markdown to a note or section. Useful for Inbox, logs, and incremental memory entries.',
+  {
+    path: z.string().describe('Relative .md path inside the vault'),
+    content: z.string().describe('Markdown content to append'),
+    section: z.string().optional().describe('Heading text to append under or create'),
+    create_if_missing: z.boolean().optional().describe('Create the note if it does not exist'),
+    expected_hash: z.string().optional().describe('Optional optimistic-lock hash'),
+  },
+  async ({ path: notePath, content, section, create_if_missing, expected_hash }) => {
+    try {
+      return jsonResponse(
+        vault.appendToNote({
+          path: notePath,
+          content,
+          section,
+          createIfMissing: create_if_missing,
+          expectedHash: expected_hash,
+        }),
+      );
+    } catch (err) {
+      return errorResponse(err);
+    }
+  },
+);
+
+// ── Tool: read_agent_memory ─────────────────────────────────
+
+server.tool(
+  'read_agent_memory',
+  'Read agent memory files from 00_Meta/AI-System.',
+  {
+    files: z.array(memoryFileSchema).optional().describe('Memory files to read; defaults to all files'),
+  },
+  async ({ files }) => {
+    try {
+      return jsonResponse(vault.readAgentMemory({ files }));
+    } catch (err) {
+      return errorResponse(err);
+    }
+  },
+);
+
+// ── Tool: add_agent_memory ──────────────────────────────────
+
+server.tool(
+  'add_agent_memory',
+  'Append a rule, mistake, example, project, style, or role memory entry under 00_Meta/AI-System.',
+  {
+    type: memoryTypeSchema.describe('Memory entry type'),
+    content: z.string().describe('Memory entry content'),
+    source_path: z.string().optional().describe('Optional source note path'),
+    tags: z.array(z.string()).optional().describe('Optional memory tags'),
+  },
+  async ({ type, content, source_path, tags }) => {
+    try {
+      return jsonResponse(
+        vault.addAgentMemory({
+          type,
+          content,
+          sourcePath: source_path,
+          tags,
+        }),
+      );
+    } catch (err) {
+      return errorResponse(err);
+    }
   },
 );
 

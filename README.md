@@ -1,6 +1,6 @@
 # SecondBrain MCP
 
-Read-only MCP-сервер для Obsidian vault. Даёт AI-ассистентам (Claude, ChatGPT и др.) семантический доступ к заметкам, проектам, решениям и задачам.
+Safe MCP-сервер для Obsidian vault. Даёт AI-ассистентам (Claude, ChatGPT и др.) семантический доступ к заметкам, проектам, решениям и задачам, а также безопасные операции создания и подтверждённого редактирования.
 
 ## Что умеет
 
@@ -11,11 +11,68 @@ Read-only MCP-сервер для Obsidian vault. Даёт AI-ассистент
 | `healthcheck` | Статус vault и статистика |
 | `search_knowledge` | Полнотекстовый поиск + фильтры по frontmatter |
 | `get_note` | Чтение заметки по пути или имени |
+| `list_notes` | Список заметок с метаданными, `mtime`, `size`, `hash`, фильтрами и пагинацией |
+| `read_notes_batch` | Batch-чтение нескольких заметок для сборки LLM-контекста |
+| `get_note_metadata` | Метаданные заметки: frontmatter, hash, links, backlinks, tags, line count |
+| `validate_vault_path` | Проверка безопасности пути для чтения или записи |
+| `create_note` | Создание новой markdown-заметки с YAML-frontmatter |
+| `propose_note_update` | Подготовка diff без записи файла |
+| `apply_note_update` | Применение подтверждённой правки с `expected_hash` |
+| `append_to_note` | Добавление блока в заметку или секцию |
+| `read_agent_memory` | Чтение памяти агента из `00_Meta/AI-System` |
+| `add_agent_memory` | Добавление правила, ошибки, примера, проекта, роли или стиля в память агента |
 | `list_projects` | Список проектов с фильтром по статусу |
 | `get_project_context` | Полный контекст проекта: содержимое + связи + задачи + решения |
 | `find_related` | Связанные заметки через wikilinks, backlinks, общие теги |
 | `extract_tasks` | Открытые/завершённые задачи из vault или папки |
 | `extract_decisions` | Записи из журнала решений |
+
+## Safe-write контракт
+
+MCP v0.3 поддерживает запись, но не даёт агенту тихо перезаписывать vault.
+
+1. Клиент получает `hash` через `list_notes` или `get_note_metadata`.
+2. Клиент вызывает `propose_note_update` и показывает пользователю diff.
+3. Пользователь подтверждает изменение в UI.
+4. Клиент вызывает `apply_note_update` с `confirmed: true` и тем же `expected_hash`.
+5. Если файл изменился между шагами, MCP вернёт ошибку hash mismatch.
+
+Все операции записи проходят `validate_vault_path`. Запрещены абсолютные пути, выход за пределы vault, запись не-`.md` файлов и доступ к исключённым папкам.
+
+Память агента хранится в:
+
+```txt
+00_Meta/AI-System/
+  role.md
+  rules.md
+  style.md
+  projects.md
+  mistakes.md
+  examples.md
+```
+
+Для `second-brain-vault` действует соглашение: новые заметки должны иметь YAML-frontmatter, поля `type`, `status`, `created`, `updated`, `tags`, `aliases`, `related`, а `related` должен ссылаться хотя бы на один MOC.
+
+## Поиск v0.3
+
+`search_knowledge` теперь использует ранжирование по нескольким полям:
+
+- `title` и имя файла;
+- `aliases`;
+- `tags`;
+- `related`;
+- markdown content.
+
+Запрос нормализуется по пробелам, дефисам, `/`, `_` и wikilink-синтаксису, поэтому `AI Sprint` может находить `AI-Sprint`, `ai/sprint` и `[[AI Sprint]]`. В ответе есть `score`, `matches` и `snippet`, чтобы UI мог показать, почему заметка попала в выдачу.
+
+Рекомендуемый flow для приложения:
+
+```txt
+search_knowledge
+→ read_notes_batch top-K
+→ find_related / get_note_metadata при необходимости
+→ LLM context builder
+```
 
 ## Установка
 
@@ -23,6 +80,7 @@ Read-only MCP-сервер для Obsidian vault. Даёт AI-ассистент
 git clone <repo-url> && cd sb-mcp
 npm install
 npm run build
+npm test
 ```
 
 ## Запуск
@@ -140,3 +198,4 @@ WantedBy=multi-user.target
 - **Статусы:** `active`, `paused`, `done`, `someday`
 - **Frontmatter:** YAML с полями `type`, `status`, `created`, `updated`, `tags`, `aliases`, `related`
 - **Связи:** `[[wikilinks]]` + `related:` в frontmatter + backlinks + общие теги
+- **Оптимистическая блокировка:** write-операции используют `hash`, чтобы UI применял только просмотренную пользователем версию файла

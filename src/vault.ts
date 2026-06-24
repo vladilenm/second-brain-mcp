@@ -1,19 +1,250 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import matter from 'gray-matter';
 import type {
-  Note,
-  Frontmatter,
-  Task,
+  AddAgentMemoryInput,
+  AddAgentMemoryResult,
+  AgentMemoryFile,
+  AgentMemoryType,
+  AppendToNoteInput,
+  AppendToNoteResult,
+  ApplyNoteUpdateInput,
+  ApplyNoteUpdateResult,
+  Backlink,
+  CreateNoteInput,
+  CreateNoteResult,
   Decision,
-  ProjectContext,
-  VaultStats,
+  Frontmatter,
+  ListNotesOptions,
+  ListNotesResult,
+  Note,
+  NoteLink,
+  NoteMetadata,
+  NoteSummary,
   NoteType,
+  NoteUpdateInput,
+  NoteUpdateProposal,
+  PathValidationResult,
+  ReadAgentMemoryOptions,
+  ReadAgentMemoryResult,
+  ReadNotesBatchOptions,
+  ReadNotesBatchResult,
+  Task,
+  VaultStats,
+  ProjectContext,
 } from './types.js';
-import { EXCLUDED_FOLDERS, PARA_FOLDERS } from './types.js';
+import { AI_SYSTEM_FOLDER, EXCLUDED_FOLDERS, PARA_FOLDERS } from './types.js';
+
+const DEFAULT_LIST_LIMIT = 50;
+const WIKILINK_REGEX = /\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g;
+const MEMORY_FILE_BY_TYPE: Record<AgentMemoryType, AgentMemoryFile> = {
+  role: 'role',
+  rule: 'rules',
+  style: 'style',
+  project: 'projects',
+  mistake: 'mistakes',
+  example: 'examples',
+};
+const MEMORY_TITLE_BY_FILE: Record<AgentMemoryFile, string> = {
+  role: 'Agent Role',
+  rules: 'Agent Rules',
+  style: 'Agent Style',
+  projects: 'Agent Projects',
+  mistakes: 'Agent Mistakes',
+  examples: 'Agent Examples',
+};
 
 export class Vault {
   constructor(private readonly root: string) {}
+
+  private normalizeRelativePath(input: string): string {
+    return input.replace(/\\/g, '/').replace(/^\/+/, '');
+  }
+
+  private absolutePath(relativePath: string): string {
+    return path.resolve(this.root, this.normalizeRelativePath(relativePath));
+  }
+
+  private isInsideRoot(absPath: string): boolean {
+    const rootPath = path.resolve(this.root);
+    return absPath === rootPath || absPath.startsWith(rootPath + path.sep);
+  }
+
+  private today(): string {
+    return new Date().toISOString().slice(0, 10);
+  }
+
+  private hashContent(content: string): string {
+    return crypto.createHash('sha256').update(content).digest('hex');
+  }
+
+  private hashFile(absPath: string): string {
+    return this.hashContent(fs.readFileSync(absPath, 'utf-8'));
+  }
+
+  private titleFor(note: Note): string {
+    const explicitTitle = note.frontmatter.title;
+    if (typeof explicitTitle === 'string' && explicitTitle.trim()) {
+      return explicitTitle.trim();
+    }
+    const heading = note.content.match(/^#\s+(.+)$/m);
+    return heading?.[1]?.trim() || note.name;
+  }
+
+  private noteSummary(note: Note): NoteSummary {
+    const absPath = this.absolutePath(note.path);
+    const stats = fs.statSync(absPath);
+    return {
+      path: note.path,
+      name: note.name,
+      title: this.titleFor(note),
+      folder: path.dirname(note.path).replace(/\\/g, '/'),
+      frontmatter: note.frontmatter,
+      mtime: stats.mtime.toISOString(),
+      size: stats.size,
+      hash: this.hashFile(absPath),
+    };
+  }
+
+  private serializeNote(frontmatter: Frontmatter, content: string): string {
+    const normalizedContent = content.endsWith('\n') ? content : content + '\n';
+    return matter.stringify(normalizedContent, frontmatter);
+  }
+
+  private touchFrontmatter(frontmatter: Frontmatter): Frontmatter {
+    return {
+      ...frontmatter,
+      updated: this.today(),
+    };
+  }
+
+  private ensureCreateFrontmatter(frontmatter: Frontmatter): {
+    frontmatter: Frontmatter;
+    warnings: string[];
+  } {
+    const warnings: string[] = [];
+    const today = this.today();
+    const next: Frontmatter = {
+      ...frontmatter,
+      created: typeof frontmatter.created === 'string' ? frontmatter.created : today,
+      updated: today,
+    };
+
+    if (!next.type) warnings.push('Missing frontmatter.type');
+    if (!next.status) warnings.push('Missing frontmatter.status');
+    if (!Array.isArray(next.related) || next.related.length === 0) {
+      warnings.push('Missing frontmatter.related link to a MOC');
+    }
+    if (!Array.isArray(next.tags)) {
+      next.tags = [];
+    }
+    if (!Array.isArray(next.aliases)) {
+      next.aliases = [];
+    }
+
+    return { frontmatter: next, warnings };
+  }
+
+  private extractWikilinksFromText(text: string): NoteLink[] {
+    const links: NoteLink[] = [];
+    let match: RegExpExecArray | null;
+    WIKILINK_REGEX.lastIndex = 0;
+    while ((match = WIKILINK_REGEX.exec(text)) !== null) {
+      links.push({
+        target: match[1].trim(),
+        raw: match[0],
+      });
+    }
+    return links;
+  }
+
+  private extractLinks(note: Note, allNotes: Note[]): NoteLink[] {
+    const frontmatterLinks = (note.frontmatter.related ?? [])
+      .flatMap((value) => this.extractWikilinksFromText(String(value)));
+    const contentLinks = this.extractWikilinksFromText(note.content);
+    return [...frontmatterLinks, ...contentLinks].map((link) => ({
+      ...link,
+      path: this.resolveLinkPath(link.target, allNotes),
+    }));
+  }
+
+  private resolveLinkPath(target: string, allNotes: Note[]): string | undefined {
+    const normalized = target.replace(/\.md$/, '').toLowerCase();
+    return allNotes.find((note) => {
+      const candidates = [
+        note.path.replace(/\.md$/, ''),
+        path.basename(note.path, '.md'),
+        note.name,
+        this.titleFor(note),
+        ...(note.frontmatter.aliases ?? []),
+      ].map((candidate) => candidate.toLowerCase());
+      return candidates.includes(normalized);
+    })?.path;
+  }
+
+  private buildBacklinks(note: Note, allNotes: Note[]): Backlink[] {
+    const backlinks: Backlink[] = [];
+    for (const other of allNotes) {
+      if (other.path === note.path) continue;
+      const links = this.extractLinks(other, allNotes);
+      for (const link of links) {
+        if (link.path === note.path) {
+          backlinks.push({
+            path: other.path,
+            name: other.name,
+            type: other.frontmatter.type,
+            target: link.target,
+          });
+        }
+      }
+    }
+    return backlinks;
+  }
+
+  private diffLines(oldContent: string, newContent: string): string {
+    const oldLines = oldContent.split('\n');
+    const newLines = newContent.split('\n');
+    const max = Math.max(oldLines.length, newLines.length);
+    const lines: string[] = [];
+    for (let i = 0; i < max; i++) {
+      const oldLine = oldLines[i];
+      const newLine = newLines[i];
+      if (oldLine === newLine) {
+        if (oldLine !== undefined) lines.push(` ${oldLine}`);
+        continue;
+      }
+      if (oldLine !== undefined) lines.push(`-${oldLine}`);
+      if (newLine !== undefined) lines.push(`+${newLine}`);
+    }
+    return lines.join('\n');
+  }
+
+  private memoryPath(file: AgentMemoryFile): string {
+    return `${AI_SYSTEM_FOLDER}/${file}.md`;
+  }
+
+  private normalizeSearchText(value: string): string {
+    return value
+      .toLowerCase()
+      .replace(/\[\[|\]\]/g, ' ')
+      .replace(/[-_/|#:[\](),.]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  private firstSnippet(content: string, terms: string[]): string {
+    const normalizedContent = this.normalizeSearchText(content);
+    const firstTerm = terms.find((term) => normalizedContent.includes(term));
+    if (!firstTerm) return content.slice(0, 200).trim();
+
+    const lowerContent = content.toLowerCase();
+    const idx = lowerContent.indexOf(firstTerm);
+    const safeIdx = idx === -1 ? normalizedContent.indexOf(firstTerm) : idx;
+    const start = Math.max(0, safeIdx - 80);
+    const end = Math.min(content.length, safeIdx + firstTerm.length + 120);
+    return `${start > 0 ? '...' : ''}${content.slice(start, end).trim()}${end < content.length ? '...' : ''}`;
+  }
 
   // ── Scanning ──────────────────────────────────────────────
 
@@ -63,6 +294,336 @@ export class Vault {
       .filter((n): n is Note => n !== null);
   }
 
+  validateVaultPath(inputPath: string, operation: 'read' | 'write'): PathValidationResult {
+    const normalized = this.normalizeRelativePath(inputPath);
+    const absPath = this.absolutePath(normalized);
+    const segments = normalized.split('/').filter(Boolean);
+
+    if (!inputPath.trim()) {
+      return { allowed: false, path: normalized, operation, reason: 'Path is empty' };
+    }
+    if (path.isAbsolute(inputPath)) {
+      return { allowed: false, path: normalized, operation, reason: 'Absolute paths are not allowed' };
+    }
+    if (!this.isInsideRoot(absPath) || segments.includes('..')) {
+      return { allowed: false, path: normalized, operation, reason: 'Path escapes vault root' };
+    }
+    const excluded = segments.find((segment) => EXCLUDED_FOLDERS.includes(segment as typeof EXCLUDED_FOLDERS[number]));
+    if (excluded) {
+      return { allowed: false, path: normalized, operation, reason: `Path is inside excluded folder: ${excluded}` };
+    }
+    if (operation === 'write') {
+      if (!normalized.endsWith('.md')) {
+        return { allowed: false, path: normalized, operation, reason: 'Only .md files can be written' };
+      }
+      if (/\s/.test(path.basename(normalized))) {
+        return { allowed: false, path: normalized, operation, reason: 'Markdown file names must not contain spaces' };
+      }
+    }
+
+    return { allowed: true, path: normalized, operation };
+  }
+
+  listNotes(options: ListNotesOptions = {}): ListNotesResult {
+    const limit = Math.min(Math.max(options.limit ?? DEFAULT_LIST_LIMIT, 1), 200);
+    const offset = Math.max(options.offset ?? 0, 0);
+    let notes = this.getAllNotes();
+
+    if (options.folder) {
+      const validation = this.validateVaultPath(`${options.folder.replace(/\/+$/, '')}/placeholder.md`, 'read');
+      if (!validation.allowed) throw new Error(validation.reason);
+      const folder = this.normalizeRelativePath(options.folder).replace(/\/+$/, '');
+      notes = notes.filter((note) => note.path === folder || note.path.startsWith(folder + '/'));
+    }
+    if (options.includeArchived === false) {
+      notes = notes.filter((note) => !note.path.startsWith(`${PARA_FOLDERS.archives}/`));
+    }
+    if (options.type) {
+      notes = notes.filter((note) => note.frontmatter.type === options.type);
+    }
+    if (options.status) {
+      notes = notes.filter((note) => note.frontmatter.status === options.status);
+    }
+    if (options.tags?.length) {
+      notes = notes.filter((note) => {
+        const noteTags = note.frontmatter.tags ?? [];
+        return options.tags!.some((tag) => noteTags.includes(tag));
+      });
+    }
+
+    const summaries = notes.map((note) => this.noteSummary(note));
+    const sortBy = options.sortBy ?? 'path';
+    summaries.sort((a, b) => {
+      if (sortBy === 'mtime') return b.mtime.localeCompare(a.mtime);
+      if (sortBy === 'created') {
+        return String(b.frontmatter.created ?? '').localeCompare(String(a.frontmatter.created ?? ''));
+      }
+      if (sortBy === 'updated') {
+        return String(b.frontmatter.updated ?? '').localeCompare(String(a.frontmatter.updated ?? ''));
+      }
+      return String(a[sortBy]).localeCompare(String(b[sortBy]));
+    });
+
+    return {
+      total: summaries.length,
+      limit,
+      offset,
+      notes: summaries.slice(offset, offset + limit),
+    };
+  }
+
+  readNotesBatch(options: ReadNotesBatchOptions): ReadNotesBatchResult {
+    const notes: ReadNotesBatchResult['notes'] = [];
+    const missing: string[] = [];
+    const includeFrontmatter = options.includeFrontmatter ?? true;
+    const includeContent = options.includeContent ?? true;
+
+    for (const notePath of options.paths) {
+      const note = this.getNote(notePath);
+      if (!note) {
+        missing.push(notePath);
+        continue;
+      }
+      const absPath = this.absolutePath(note.path);
+      const result: ReadNotesBatchResult['notes'][number] = {
+        path: note.path,
+        name: note.name,
+        hash: this.hashFile(absPath),
+      };
+      if (includeFrontmatter) result.frontmatter = note.frontmatter;
+      if (includeContent) {
+        result.content =
+          typeof options.maxCharsPerNote === 'number'
+            ? note.content.slice(0, options.maxCharsPerNote)
+            : note.content;
+      }
+      notes.push(result);
+    }
+
+    return { total: notes.length, notes, missing };
+  }
+
+  getNoteMetadata(identifier: string): NoteMetadata | null {
+    const note = this.getNote(identifier);
+    if (!note) return null;
+    const allNotes = this.getAllNotes();
+    const summary = this.noteSummary(note);
+    return {
+      ...summary,
+      links: this.extractLinks(note, allNotes),
+      backlinks: this.buildBacklinks(note, allNotes),
+      tags: note.frontmatter.tags ?? [],
+      lineCount: note.content.split('\n').length,
+    };
+  }
+
+  createNote(input: CreateNoteInput): CreateNoteResult {
+    const validation = this.validateVaultPath(input.path, 'write');
+    if (!validation.allowed) throw new Error(validation.reason);
+    const notePath = validation.path;
+    const absPath = this.absolutePath(notePath);
+    const exists = fs.existsSync(absPath);
+
+    if (exists) {
+      throw new Error(`Refusing to modify existing note through createNote: ${notePath}. Use appendToNote or applyNoteUpdate.`);
+    }
+
+    const { frontmatter, warnings } = this.ensureCreateFrontmatter(input.frontmatter);
+    if (warnings.some((warning) => warning.startsWith('Missing'))) {
+      throw new Error(`Invalid note frontmatter: ${warnings.join('; ')}`);
+    }
+
+    const serialized = this.serializeNote(frontmatter, input.content);
+    if (input.dryRun) {
+      return {
+        path: notePath,
+        hash: this.hashContent(serialized),
+        wouldWrite: true,
+        warnings,
+      };
+    }
+
+    fs.mkdirSync(path.dirname(absPath), { recursive: true });
+    fs.writeFileSync(absPath, serialized, 'utf-8');
+
+    return {
+      path: notePath,
+      hash: this.hashFile(absPath),
+      wouldWrite: false,
+      warnings,
+    };
+  }
+
+  proposeNoteUpdate(input: NoteUpdateInput): NoteUpdateProposal {
+    const validation = this.validateVaultPath(input.path, 'write');
+    if (!validation.allowed) throw new Error(validation.reason);
+    const note = this.getNote(validation.path);
+    if (!note) throw new Error(`Note not found: ${input.path}`);
+    const absPath = this.absolutePath(note.path);
+    const oldHash = this.hashFile(absPath);
+    if (input.expectedHash && input.expectedHash !== oldHash) {
+      throw new Error(`Hash mismatch for ${note.path}`);
+    }
+
+    const nextFrontmatter = this.touchFrontmatter(note.frontmatter);
+    const serialized = this.serializeNote(nextFrontmatter, input.newContent);
+    return {
+      path: note.path,
+      oldHash,
+      newHash: this.hashContent(serialized),
+      diff: this.diffLines(note.content.trimEnd(), input.newContent.trimEnd()),
+      validationWarnings: [],
+    };
+  }
+
+  applyNoteUpdate(input: ApplyNoteUpdateInput): ApplyNoteUpdateResult {
+    if (!input.confirmed) {
+      throw new Error('Note update must be confirmed by the user');
+    }
+    if (!input.expectedHash) {
+      throw new Error('expectedHash is required for safe note updates');
+    }
+    const proposal = this.proposeNoteUpdate(input);
+    const note = this.getNote(input.path);
+    if (!note) throw new Error(`Note not found: ${input.path}`);
+
+    const absPath = this.absolutePath(note.path);
+    let backupPath: string | undefined;
+    if (input.backup !== false) {
+      const safeName = note.path.replace(/[\/\\]/g, '__');
+      backupPath = `${AI_SYSTEM_FOLDER}/backups/${Date.now()}-${safeName}`;
+      const backupAbsPath = this.absolutePath(backupPath);
+      fs.mkdirSync(path.dirname(backupAbsPath), { recursive: true });
+      fs.copyFileSync(absPath, backupAbsPath);
+    }
+
+    const serialized = this.serializeNote(this.touchFrontmatter(note.frontmatter), input.newContent);
+    fs.writeFileSync(absPath, serialized, 'utf-8');
+    return {
+      path: note.path,
+      oldHash: proposal.oldHash,
+      newHash: this.hashFile(absPath),
+      backupPath,
+    };
+  }
+
+  appendToNote(input: AppendToNoteInput): AppendToNoteResult {
+    const validation = this.validateVaultPath(input.path, 'write');
+    if (!validation.allowed) throw new Error(validation.reason);
+
+    const notePath = validation.path;
+    let note = this.getNote(notePath);
+    if (!note) {
+      if (!input.createIfMissing) {
+        throw new Error(`Note not found: ${notePath}`);
+      }
+      this.createNote({
+        path: notePath,
+        frontmatter: {
+          type: 'resource',
+          status: 'active',
+          tags: ['ai-system'],
+          aliases: [path.basename(notePath, '.md')],
+          related: ['[[Home]]'],
+        },
+        content: `# ${path.basename(notePath, '.md')}\n`,
+      });
+      note = this.getNote(notePath);
+    }
+    if (!note) throw new Error(`Note not found: ${notePath}`);
+
+    const absPath = this.absolutePath(note.path);
+    const oldHash = this.hashFile(absPath);
+    if (input.expectedHash && input.expectedHash !== oldHash) {
+      throw new Error(`Hash mismatch for ${note.path}`);
+    }
+
+    const addition = input.content.endsWith('\n') ? input.content : input.content + '\n';
+    let nextContent = note.content;
+    if (input.section) {
+      const sectionRegex = new RegExp(`^(#{1,6})\\s+${input.section.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'm');
+      const match = sectionRegex.exec(nextContent);
+      if (match) {
+        const afterHeading = match.index + match[0].length;
+        const rest = nextContent.slice(afterHeading);
+        const nextHeading = rest.search(/\n#{1,6}\s+/);
+        const insertAt = nextHeading === -1 ? nextContent.length : afterHeading + nextHeading;
+        nextContent =
+          nextContent.slice(0, insertAt).replace(/\s*$/, '\n\n') +
+          addition +
+          nextContent.slice(insertAt);
+      } else {
+        nextContent = `${nextContent.trimEnd()}\n\n## ${input.section}\n\n${addition}`;
+      }
+    } else {
+      nextContent = `${nextContent.trimEnd()}\n\n${addition}`;
+    }
+
+    const serialized = this.serializeNote(this.touchFrontmatter(note.frontmatter), nextContent);
+    fs.writeFileSync(absPath, serialized, 'utf-8');
+    return {
+      path: note.path,
+      oldHash,
+      newHash: this.hashFile(absPath),
+    };
+  }
+
+  readAgentMemory(options: ReadAgentMemoryOptions = {}): ReadAgentMemoryResult {
+    const files = options.files ?? ['role', 'rules', 'style', 'projects', 'mistakes', 'examples'];
+    return {
+      folder: AI_SYSTEM_FOLDER,
+      files: files.map((file) => {
+        const notePath = this.memoryPath(file);
+        const note = this.getNote(notePath);
+        return {
+          type: file,
+          path: notePath,
+          exists: note !== null,
+          content: note?.content ?? '',
+          frontmatter: note?.frontmatter,
+        };
+      }),
+    };
+  }
+
+  addAgentMemory(input: AddAgentMemoryInput): AddAgentMemoryResult {
+    const file = MEMORY_FILE_BY_TYPE[input.type];
+    const notePath = this.memoryPath(file);
+    const absolute = this.absolutePath(notePath);
+    if (!fs.existsSync(absolute)) {
+      this.createNote({
+        path: notePath,
+        frontmatter: {
+          type: 'resource',
+          status: 'active',
+          tags: ['ai-system', 'memory'],
+          aliases: [MEMORY_TITLE_BY_FILE[file]],
+          related: ['[[Home]]'],
+        },
+        content: `# ${MEMORY_TITLE_BY_FILE[file]}\n`,
+      });
+    }
+
+    const metadata = this.getNoteMetadata(notePath);
+    const entryLines = [
+      `- ${input.content}`,
+      input.sourcePath ? `  - source: ${input.sourcePath}` : undefined,
+      input.tags?.length ? `  - tags: ${input.tags.join(', ')}` : undefined,
+    ].filter((line): line is string => Boolean(line));
+    const appended = this.appendToNote({
+      path: notePath,
+      section: this.today(),
+      content: entryLines.join('\n'),
+      expectedHash: metadata?.hash,
+    });
+
+    return {
+      type: input.type,
+      path: notePath,
+      newHash: appended.newHash,
+    };
+  }
+
   // ── Tools implementation ──────────────────────────────────
 
   /** healthcheck — vault stats */
@@ -102,15 +663,24 @@ export class Vault {
   searchKnowledge(
     query: string,
     opts: { type?: NoteType; status?: string; tags?: string[]; limit?: number } = {},
-  ): Array<{ path: string; name: string; frontmatter: Frontmatter; snippet: string }> {
+  ): Array<{
+    path: string;
+    name: string;
+    frontmatter: Frontmatter;
+    snippet: string;
+    score: number;
+    matches: Array<{ field: string; term: string; weight: number }>;
+  }> {
     const limit = opts.limit ?? 20;
-    const q = query.toLowerCase();
+    const normalizedQuery = this.normalizeSearchText(query);
+    const terms = normalizedQuery.split(' ').filter(Boolean);
     const notes = this.getAllNotes();
 
     const scored: Array<{
       note: Note;
       score: number;
       snippet: string;
+      matches: Array<{ field: string; term: string; weight: number }>;
     }> = [];
 
     for (const note of notes) {
@@ -123,60 +693,82 @@ export class Vault {
       }
 
       let score = 0;
-      const lowerContent = note.content.toLowerCase();
-      const lowerName = note.name.toLowerCase();
+      const matches: Array<{ field: string; term: string; weight: number }> = [];
+      const fieldWeights = [
+        { field: 'title', value: this.titleFor(note), exact: 20, token: 5 },
+        { field: 'name', value: note.name, exact: 16, token: 4 },
+        { field: 'alias', value: (note.frontmatter.aliases ?? []).join(' '), exact: 18, token: 4 },
+        { field: 'tag', value: (note.frontmatter.tags ?? []).join(' '), exact: 14, token: 3 },
+        { field: 'related', value: (note.frontmatter.related ?? []).join(' '), exact: 10, token: 2 },
+        { field: 'content', value: note.content, exact: 6, token: 1 },
+      ];
 
-      // Name match (highest weight)
-      if (lowerName.includes(q)) score += 10;
-
-      // Alias match
-      const aliases = note.frontmatter.aliases ?? [];
-      if (aliases.some((a) => a.toLowerCase().includes(q))) score += 8;
-
-      // Tag match
-      const tags = note.frontmatter.tags ?? [];
-      if (tags.some((t) => t.toLowerCase().includes(q))) score += 5;
-
-      // Content match
-      const contentIdx = lowerContent.indexOf(q);
-      if (contentIdx !== -1) score += 3;
+      for (const weightedField of fieldWeights) {
+        const fieldText = this.normalizeSearchText(weightedField.value);
+        if (!fieldText) continue;
+        if (normalizedQuery && fieldText.includes(normalizedQuery)) {
+          score += weightedField.exact;
+          matches.push({
+            field: weightedField.field,
+            term: normalizedQuery,
+            weight: weightedField.exact,
+          });
+        }
+        for (const term of terms) {
+          if (term !== normalizedQuery && fieldText.includes(term)) {
+            score += weightedField.token;
+            matches.push({
+              field: weightedField.field,
+              term,
+              weight: weightedField.token,
+            });
+          }
+        }
+      }
 
       if (score === 0) continue;
 
-      // Extract snippet around first match
-      let snippet = '';
-      if (contentIdx !== -1) {
-        const start = Math.max(0, contentIdx - 80);
-        const end = Math.min(note.content.length, contentIdx + query.length + 120);
-        snippet = (start > 0 ? '...' : '') + note.content.slice(start, end).trim() + (end < note.content.length ? '...' : '');
-      } else {
-        snippet = note.content.slice(0, 200).trim();
-      }
-
-      scored.push({ note, score, snippet });
+      scored.push({ note, score, snippet: this.firstSnippet(note.content, terms), matches });
     }
 
     return scored
       .sort((a, b) => b.score - a.score)
       .slice(0, limit)
-      .map(({ note, snippet }) => ({
+      .map(({ note, snippet, score, matches }) => ({
         path: note.path,
         name: note.name,
         frontmatter: note.frontmatter,
         snippet,
+        score,
+        matches,
       }));
   }
 
   /** get_note — read a single note by path or name */
   getNote(identifier: string): Note | null {
     // Try exact path first
-    const absExact = path.join(this.root, identifier);
-    if (fs.existsSync(absExact)) {
+    const looksLikePath = identifier.includes('/') || identifier.endsWith('.md');
+    if (looksLikePath) {
+      const validation = this.validateVaultPath(identifier, 'read');
+      if (!validation.allowed) return null;
+      const absExact = this.absolutePath(validation.path);
+      if (fs.existsSync(absExact)) {
+        return this.parseNote(absExact);
+      }
+      const absMd = absExact.endsWith('.md') ? absExact : absExact + '.md';
+      if (fs.existsSync(absMd)) {
+        return this.parseNote(absMd);
+      }
+      return null;
+    }
+
+    const absExact = this.absolutePath(identifier);
+    if (this.isInsideRoot(absExact) && fs.existsSync(absExact)) {
       return this.parseNote(absExact);
     }
     // Try with .md
     const absMd = absExact.endsWith('.md') ? absExact : absExact + '.md';
-    if (fs.existsSync(absMd)) {
+    if (this.isInsideRoot(absMd) && fs.existsSync(absMd)) {
       return this.parseNote(absMd);
     }
     // Search by name/alias
